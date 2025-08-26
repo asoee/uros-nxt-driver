@@ -22,18 +22,19 @@
 const int L_FORW = 3;
 const int L_BACK = 4;
 const int L_enablePin = 2;
-const int L_encoderPin1 = 18;
-const int L_encoderPin2 = 21;
+const int L_encoderPin1 = 6;
+const int L_encoderPin2 = 7;
 // right wheel
 const int R_FORW = 33;
 const int R_BACK = 32;
 const int R_enablePin = 5;
-const int R_encoderPin1 = 23;
-const int R_encoderPin2 = 15;
+const int R_encoderPin1 = 20;
+const int R_encoderPin2 = 21;
 
 // encoder value per revolution of left wheel and right wheel
-const int tickPerRevolution_LW = 1055;
-const int tickPerRevolution_RW = 1055;
+// Hardware specs: 12 slits, 32:10 gear ratio = 720 ticks/rev with quadrature
+const int tickPerRevolution_LW = 720;
+const int tickPerRevolution_RW = 720;
 const int threshold = 0;
 
 // pwm parameters setup
@@ -71,10 +72,22 @@ public:
     int tick;
     uint pwm_slice_num;
 
+    // Speed and direction tracking
+    volatile float CurrentSpeed; // in rad/s
+    volatile int Direction;      // 1 for forward, -1 for backward, 0 for stopped
+    volatile unsigned long LastUpdateTime;
+    volatile long LastPosition;
+    volatile bool EncoderAState;
+    volatile bool EncoderBState;
+    volatile bool LastEncoderAState;
+    volatile bool LastEncoderBState;
+
     MotorController(int ForwardPin, int BackwardPin, int EnablePin, int EncoderA, int EncoderB, int tickPerRevolution)
         : Forward(ForwardPin), Backward(BackwardPin), Enable(EnablePin),
           EncoderPinA(EncoderA), EncoderPinB(EncoderB), tick(tickPerRevolution),
-          CurrentPosition(0), PreviousPosition(0)
+          CurrentPosition(0), PreviousPosition(0), CurrentSpeed(0.0), Direction(0),
+          LastUpdateTime(0), LastPosition(0), EncoderAState(false), EncoderBState(false),
+          LastEncoderAState(false), LastEncoderBState(false)
     {
         gpio_init(Forward);
         gpio_set_dir(Forward, GPIO_OUT);
@@ -84,8 +97,21 @@ public:
         gpio_set_dir(EnablePin, GPIO_OUT);
         gpio_init(EncoderPinA);
         gpio_set_dir(EncoderPinA, GPIO_IN);
+        gpio_pull_up(EncoderPinA);
         gpio_init(EncoderPinB);
         gpio_set_dir(EncoderPinB, GPIO_IN);
+        gpio_pull_up(EncoderPinB);
+
+        // Initialize encoder states
+        EncoderAState = gpio_get(EncoderPinA);
+        EncoderBState = gpio_get(EncoderPinB);
+        LastEncoderAState = EncoderAState;
+        LastEncoderBState = EncoderBState;
+        LastUpdateTime = to_ms_since_boot(get_absolute_time());
+        
+        // Debug: Print initial encoder states (will be visible during startup)
+        printf("Motor init: EncoderA=%d EncoderB=%d (pins %d,%d)\n", 
+               EncoderAState, EncoderBState, EncoderPinA, EncoderPinB);
 
         // Initialize PWM for this motor
         gpio_set_function(Enable, GPIO_FUNC_PWM);
@@ -98,6 +124,124 @@ public:
     float getPosition()
     {
         return ((float)CurrentPosition / tick) * 2.0 * 3.14159;
+    }
+
+    // get current speed in rad/s
+    float getSpeed()
+    {
+        return CurrentSpeed;
+    }
+
+    // get current direction (-1, 0, 1)
+    int getDirection()
+    {
+        return Direction;
+    }
+
+    // update speed and direction based on encoder changes
+    void updateSpeedAndDirection()
+    {
+        unsigned long currentTime = to_ms_since_boot(get_absolute_time());
+        long positionDelta = CurrentPosition - LastPosition;
+        unsigned long timeDelta = currentTime - LastUpdateTime;
+
+        if (timeDelta > 10) // Update every 10ms minimum to avoid noise
+        {
+            if (timeDelta > 0)
+            {
+                // Calculate speed in rad/s
+                float positionRadians = ((float)positionDelta / tick) * 2.0 * 3.14159;
+                float timeSeconds = (float)timeDelta / 1000.0;
+                CurrentSpeed = positionRadians / timeSeconds;
+
+                // Determine direction
+                if (positionDelta > 0)
+                    Direction = 1; // Forward
+                else if (positionDelta < 0)
+                    Direction = -1; // Backward
+                else
+                    Direction = 0; // Stopped
+            }
+
+            LastPosition = CurrentPosition;
+            LastUpdateTime = currentTime;
+        }
+
+        // If no movement for a while, consider stopped
+        if (timeDelta > 100) // 100ms without movement (faster stop detection)
+        {
+            CurrentSpeed = 0.0;
+            Direction = 0;
+        }
+    }
+
+    // Unified encoder interrupt handler
+    void handleEncoderInterrupt(uint gpio, bool isRightWheel = false)
+    {
+        // Read current states
+        bool currentA = gpio_get(EncoderPinA);
+        bool currentB = gpio_get(EncoderPinB);
+
+        // Update encoder states
+        if (gpio == EncoderPinA)
+        {
+            LastEncoderAState = EncoderAState;
+            EncoderAState = currentA;
+        }
+        else if (gpio == EncoderPinB)
+        {
+            LastEncoderBState = EncoderBState;
+            EncoderBState = currentB;
+        }
+
+        // Quadrature decoding logic
+        if (gpio == EncoderPinA)
+        {
+            if (EncoderAState != LastEncoderAState)
+            {
+                if (isRightWheel)
+                {
+                    // Right wheel logic (opposite direction for differential drive)
+                    if (EncoderAState == EncoderBState)
+                        CurrentPosition++; // Forward
+                    else
+                        CurrentPosition--; // Reverse
+                }
+                else
+                {
+                    // Left wheel logic
+                    if (EncoderAState == EncoderBState)
+                        CurrentPosition--; // Reverse
+                    else
+                        CurrentPosition++; // Forward
+                }
+            }
+        }
+        else if (gpio == EncoderPinB)
+        {
+            if (EncoderBState != LastEncoderBState)
+            {
+                if (isRightWheel)
+                {
+                    // Right wheel logic
+                    if (EncoderBState == EncoderAState)
+                        CurrentPosition--; // Reverse
+                    else
+                        CurrentPosition++; // Forward
+                }
+                else
+                {
+                    // Left wheel logic
+                    if (EncoderBState == EncoderAState)
+                        CurrentPosition++; // Forward
+                    else
+                        CurrentPosition--; // Reverse
+                }
+            }
+        }
+
+        // Update speed and direction
+        updateSpeedAndDirection();
     }
 
     // move the motor with direct PWM control (-255 to +255)
@@ -155,25 +299,22 @@ MotorController rightWheel(R_FORW, R_BACK, R_enablePin, R_encoderPin1, R_encoder
         }                                \
     }
 
-// Interrupt handlers for encoders
-void updateEncoderL(uint gpio, uint32_t events)
+// Global interrupt handler for all encoder pins
+void encoder_interrupt_handler(uint gpio, uint32_t events)
 {
-    (void)gpio;
     (void)events;
-    if (gpio_get(leftWheel.EncoderPinB) > gpio_get(leftWheel.EncoderPinA))
-        leftWheel.CurrentPosition++;
-    else
-        leftWheel.CurrentPosition--;
-}
-
-void updateEncoderR(uint gpio, uint32_t events)
-{
-    (void)gpio;
-    (void)events;
-    if (gpio_get(rightWheel.EncoderPinA) > gpio_get(rightWheel.EncoderPinB))
-        rightWheel.CurrentPosition++;
-    else
-        rightWheel.CurrentPosition--;
+    static volatile int total_interrupt_count = 0;
+    total_interrupt_count++;
+    
+    // Determine which motor's encoder triggered the interrupt
+    if (gpio == leftWheel.EncoderPinA || gpio == leftWheel.EncoderPinB)
+    {
+        leftWheel.handleEncoderInterrupt(gpio, false); // false = left wheel
+    }
+    else if (gpio == rightWheel.EncoderPinA || gpio == rightWheel.EncoderPinB)
+    {
+        rightWheel.handleEncoderInterrupt(gpio, true); // true = right wheel
+    }
 }
 
 // State machine for agent connection
@@ -249,11 +390,24 @@ void joint_commands_callback(const void *msgin)
         float left_vel = msg->velocity.data[0];
         float right_vel = msg->velocity.data[1];
 
-        // Log velocity changes
-        snprintf(debug_buffer, sizeof(debug_buffer), "Velocity: left=%.2f, right=%.2f", left_vel, right_vel);
+        // Log velocity changes and encoder feedback
+        snprintf(debug_buffer, sizeof(debug_buffer), "Cmd: L=%.2f R=%.2f | Enc: L=%.2f R=%.2f",
+                 left_vel, right_vel, leftWheel.getSpeed(), rightWheel.getSpeed());
         publish_debug(debug_buffer);
 
+        // Log direction information occasionally
+        static int dir_log_counter = 0;
+        dir_log_counter++;
+        if (dir_log_counter % 50 == 0) // Every ~2.5 seconds at 20Hz
+        {
+            snprintf(debug_buffer, sizeof(debug_buffer), "Dir: L=%d R=%d | Pos: L=%.2f R=%.2f",
+                     leftWheel.getDirection(), rightWheel.getDirection(),
+                     leftWheel.getPosition(), rightWheel.getPosition());
+            publish_debug(debug_buffer);
+        }
+
         // Convert rad/s to PWM (-255 to +255)
+        // NOTE: Scale factor may need adjustment due to encoder tick change from 1055 to 720
         float left_pwm = left_vel * 50.0; // Scale factor - tune as needed
         float right_pwm = right_vel * 50.0;
 
@@ -303,15 +457,26 @@ void joint_states_callback(rcl_timer_t *timer, int64_t last_call_time)
     if (counter % 100 == 0) // Every 5 seconds (20Hz * 100 = 5s)
     {
         publish_debug("Joint states timer callback running - executor is working");
+        
+        // Debug encoder positions and raw tick counts
+        char debug_buffer[200];
+        snprintf(debug_buffer, sizeof(debug_buffer), "Raw ticks: L=%ld R=%ld | Positions: L=%.3f R=%.3f", 
+                leftWheel.CurrentPosition, rightWheel.CurrentPosition,
+                leftWheel.getPosition(), rightWheel.getPosition());
+        publish_debug(debug_buffer);
     }
 
+    // Update speed calculations for both wheels (handles stopped motor detection)
+    leftWheel.updateSpeedAndDirection();
+    rightWheel.updateSpeedAndDirection();
+    
     // Update joint positions from encoders
     joint_states_msg.position.data[0] = leftWheel.getPosition();
     joint_states_msg.position.data[1] = rightWheel.getPosition();
 
-    // Set velocities to 0 (could calculate from encoder if needed)
-    joint_states_msg.velocity.data[0] = 0.0;
-    joint_states_msg.velocity.data[1] = 0.0;
+    // Update velocities from encoder measurements
+    joint_states_msg.velocity.data[0] = leftWheel.getSpeed();
+    joint_states_msg.velocity.data[1] = rightWheel.getSpeed();
 
     // Set efforts to 0 (no torque sensing)
     joint_states_msg.effort.data[0] = 0.0;
@@ -330,9 +495,11 @@ void setup()
     // Set up micro-ROS transport (USB CDC will be initialized by stdio_init_all)
     set_microros_transports();
 
-    // Set up interrupt handlers for encoders
-    gpio_set_irq_enabled_with_callback(leftWheel.EncoderPinB, GPIO_IRQ_EDGE_RISE, true, &updateEncoderL);
-    gpio_set_irq_enabled_with_callback(rightWheel.EncoderPinA, GPIO_IRQ_EDGE_RISE, true, &updateEncoderR);
+    // Set up global interrupt handler for all encoder pins
+    gpio_set_irq_enabled_with_callback(leftWheel.EncoderPinA, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &encoder_interrupt_handler);
+    gpio_set_irq_enabled(leftWheel.EncoderPinB, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(rightWheel.EncoderPinA, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(rightWheel.EncoderPinB, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
 
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
