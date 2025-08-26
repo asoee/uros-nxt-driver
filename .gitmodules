@@ -1,3 +1,7 @@
 [submodule "third_party/wheel_odometry"]
 	path = third_party/wheel_odometry
 	url = https://github.com/amalshaji4540/Wheel_Odometry.git
+[submodule "uros_ws/src/micro_ros_setup"]
+	path = uros_ws/src/micro_ros_setup
+	url = https://github.com/micro-ROS/micro_ros_setup.git
+	branch = jazzy
