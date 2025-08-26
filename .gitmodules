@@ -1,0 +1,3 @@
+[submodule "third_party/wheel_odometry"]
+	path = third_party/wheel_odometry
+	url = https://github.com/amalshaji4540/Wheel_Odometry.git
