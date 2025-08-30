@@ -19,8 +19,8 @@
 
 // pin declaration
 // Left wheel
-const int L_FORW = 3;
-const int L_BACK = 4;
+const int L_FORW = 4;
+const int L_BACK = 3;
 const int L_enablePin = 2;
 const int L_encoderPin1 = 6;
 const int L_encoderPin2 = 7;
@@ -31,11 +31,21 @@ const int R_enablePin = 5;
 const int R_encoderPin1 = 20;
 const int R_encoderPin2 = 21;
 
+// Motor driver standby pin
+const int MOTOR_STANDBY_PIN = 1;
+
 // encoder value per revolution of left wheel and right wheel
 // Hardware specs: 12 slits, 32:10 gear ratio = 720 ticks/rev with quadrature
 const int tickPerRevolution_LW = 720;
 const int tickPerRevolution_RW = 720;
 const int threshold = 0;
+
+// PID tuning parameters - start conservative to prevent oscillation
+// Tuning guide: Start with Kp only, then add Ki, finally Kd
+const float PID_KP = 10.0;    // Proportional gain (start small, increase until stable response)
+const float PID_KI = 0.5;     // Integral gain (start at 0, add small amount if steady-state error)
+const float PID_KD = 0.0;     // Derivative gain (start at 0, add small amount to reduce overshoot)
+const bool ENABLE_PID = true; // Set to false to use direct PWM control for comparison
 
 // pwm parameters setup
 const int freq = 30000;
@@ -57,6 +67,97 @@ rcl_node_t node;
 rcl_timer_t joint_states_timer;
 unsigned long long time_offset = 0;
 unsigned long prev_cmd_time = 0;
+
+// PID Controller class
+class PIDController
+{
+public:
+    float kp;                // Proportional gain
+    float ki;                // Integral gain
+    float kd;                // Derivative gain
+    float setpoint;          // Target value (rad/s)
+    float integral;          // Integral accumulator
+    float prev_error;        // Previous error for derivative
+    float output_min;        // Minimum output limit
+    float output_max;        // Maximum output limit
+    unsigned long last_time; // Last calculation time
+
+    PIDController(float p = 1.0, float i = 0.0, float d = 0.0,
+                  float min_out = -200.0, float max_out = 200.0)
+        : kp(p), ki(i), kd(d), setpoint(0.0), integral(0.0),
+          prev_error(0.0), output_min(min_out), output_max(max_out),
+          last_time(0)
+    {
+    }
+
+    // Calculate PID output
+    float calculate(float measured_value, float dt_seconds)
+    {
+        if (dt_seconds <= 0.0)
+            return 0.0;
+
+        // Immediately return 0 if target speed is 0.0
+        if (fabs(setpoint) < 0.001f)
+        {
+            reset(); // Clear integral term to prevent windup
+            return 0.0;
+        }
+
+        float error = setpoint - measured_value;
+
+        // Proportional term
+        float p_term = kp * error;
+
+        // Integral term with windup protection
+        integral += error * dt_seconds;
+        // Clamp integral to prevent windup
+        float max_integral = (output_max - output_min) / (2.0 * ki);
+        if (ki > 0.0 && fabs(integral) > max_integral)
+        {
+            integral = (integral > 0) ? max_integral : -max_integral;
+        }
+        float i_term = ki * integral;
+
+        // Derivative term
+        float derivative = (error - prev_error) / dt_seconds;
+        float d_term = kd * derivative;
+
+        // Calculate total output
+        float output = p_term + i_term + d_term;
+
+        // Clamp output to limits
+        if (output > output_max)
+            output = output_max;
+        if (output < output_min)
+            output = output_min;
+
+        // Store for next calculation
+        prev_error = error;
+
+        return output;
+    }
+
+    // Set new setpoint
+    void setTarget(float target)
+    {
+        setpoint = target;
+    }
+
+    // Reset integral term (useful when changing setpoints)
+    void reset()
+    {
+        integral = 0.0;
+        prev_error = 0.0;
+    }
+
+    // Update PID parameters
+    void setParameters(float p, float i, float d)
+    {
+        kp = p;
+        ki = i;
+        kd = d;
+    }
+};
 
 // Motor controller class
 class MotorController
@@ -82,12 +183,19 @@ public:
     volatile bool LastEncoderAState;
     volatile bool LastEncoderBState;
 
+    // PID Control
+    PIDController pid_controller;
+    float target_speed;          // Target speed in rad/s
+    unsigned long last_pid_time; // Last PID calculation time
+    bool pid_enabled;
+
     MotorController(int ForwardPin, int BackwardPin, int EnablePin, int EncoderA, int EncoderB, int tickPerRevolution)
         : Forward(ForwardPin), Backward(BackwardPin), Enable(EnablePin),
           EncoderPinA(EncoderA), EncoderPinB(EncoderB), tick(tickPerRevolution),
           CurrentPosition(0), PreviousPosition(0), CurrentSpeed(0.0), Direction(0),
           LastUpdateTime(0), LastPosition(0), EncoderAState(false), EncoderBState(false),
-          LastEncoderAState(false), LastEncoderBState(false)
+          LastEncoderAState(false), LastEncoderBState(false), pid_controller(PID_KP, PID_KI, PID_KD),
+          target_speed(0.0), last_pid_time(0), pid_enabled(ENABLE_PID)
     {
         gpio_init(Forward);
         gpio_set_dir(Forward, GPIO_OUT);
@@ -108,9 +216,9 @@ public:
         LastEncoderAState = EncoderAState;
         LastEncoderBState = EncoderBState;
         LastUpdateTime = to_ms_since_boot(get_absolute_time());
-        
+
         // Debug: Print initial encoder states (will be visible during startup)
-        printf("Motor init: EncoderA=%d EncoderB=%d (pins %d,%d)\n", 
+        printf("Motor init: EncoderA=%d EncoderB=%d (pins %d,%d)\n",
                EncoderAState, EncoderBState, EncoderPinA, EncoderPinB);
 
         // Initialize PWM for this motor
@@ -136,6 +244,79 @@ public:
     int getDirection()
     {
         return Direction;
+    }
+
+    // PID control methods
+    void setTargetSpeed(float speed_rad_s)
+    {
+        target_speed = speed_rad_s;
+        pid_controller.setTarget(speed_rad_s);
+        last_pid_time = to_ms_since_boot(get_absolute_time());
+
+        // Immediately stop motor if target speed is 0
+        if (fabs(speed_rad_s) < 0.001f)
+        {
+            stop();
+        }
+    }
+
+    void setPIDParameters(float kp, float ki, float kd)
+    {
+        pid_controller.setParameters(kp, ki, kd);
+    }
+
+    void enablePID(bool enable)
+    {
+        if (enable && !pid_enabled)
+        {
+            // Reset PID when enabling
+            pid_controller.reset();
+            last_pid_time = to_ms_since_boot(get_absolute_time());
+        }
+        pid_enabled = enable;
+    }
+
+    // Update motor with PID control
+    void updatePIDControl()
+    {
+        if (!pid_enabled)
+            return;
+
+        unsigned long current_time = to_ms_since_boot(get_absolute_time());
+        float dt_seconds = (current_time - last_pid_time) / 1000.0f;
+
+        if (dt_seconds >= 0.01f) // Update at least every 10ms
+        {
+            // Safety check: limit target speed to reasonable range
+            if (fabs(target_speed) > 20.0f) // 20 rad/s max
+            {
+                target_speed = (target_speed > 0) ? 20.0f : -20.0f;
+                pid_controller.setTarget(target_speed);
+            }
+
+            float pid_output = pid_controller.calculate(CurrentSpeed, dt_seconds);
+
+            // Add minimum PWM to overcome static friction
+            if (fabs(target_speed) > 0.1f && fabs(pid_output) < 20.0f && fabs(pid_output) > 0.0f)
+            {
+                pid_output = (pid_output > 0) ? 20.0f : -20.0f;
+            }
+
+            moveMotor(pid_output);
+            last_pid_time = current_time;
+        }
+    }
+
+    // Get PID error for tuning purposes
+    float getPIDError()
+    {
+        return target_speed - CurrentSpeed;
+    }
+
+    // Get target speed
+    float getTargetSpeed()
+    {
+        return target_speed;
     }
 
     // update speed and direction based on encoder changes
@@ -277,6 +458,17 @@ public:
     }
 };
 
+// Motor driver control functions
+void enableMotorDriver()
+{
+    gpio_put(MOTOR_STANDBY_PIN, 1); // HIGH disables standby (enables motors)
+}
+
+void disableMotorDriver()
+{
+    gpio_put(MOTOR_STANDBY_PIN, 0); // LOW enables standby (disables motors)
+}
+
 // creating objects for right wheel and left wheel
 MotorController leftWheel(L_FORW, L_BACK, L_enablePin, L_encoderPin1, L_encoderPin2, tickPerRevolution_LW);
 MotorController rightWheel(R_FORW, R_BACK, R_enablePin, R_encoderPin1, R_encoderPin2, tickPerRevolution_RW);
@@ -304,11 +496,13 @@ void encoder_interrupt_handler(uint gpio, uint32_t events)
 {
     (void)events;
     static volatile int total_interrupt_count = 0;
+    static volatile int left_interrupt_count = 0;
     total_interrupt_count++;
-    
+
     // Determine which motor's encoder triggered the interrupt
     if (gpio == leftWheel.EncoderPinA || gpio == leftWheel.EncoderPinB)
     {
+        left_interrupt_count++;
         leftWheel.handleEncoderInterrupt(gpio, false); // false = left wheel
     }
     else if (gpio == rightWheel.EncoderPinA || gpio == rightWheel.EncoderPinB)
@@ -390,35 +584,55 @@ void joint_commands_callback(const void *msgin)
         float left_vel = msg->velocity.data[0];
         float right_vel = msg->velocity.data[1];
 
-        // Log velocity changes and encoder feedback
-        snprintf(debug_buffer, sizeof(debug_buffer), "Cmd: L=%.2f R=%.2f | Enc: L=%.2f R=%.2f",
-                 left_vel, right_vel, leftWheel.getSpeed(), rightWheel.getSpeed());
+        // Log control mode and speeds
+        if (ENABLE_PID)
+        {
+            snprintf(debug_buffer, sizeof(debug_buffer), "PID: Target L=%.2f R=%.2f | Actual L=%.2f R=%.2f",
+                     left_vel, right_vel, leftWheel.getSpeed(), rightWheel.getSpeed());
+        }
+        else
+        {
+            snprintf(debug_buffer, sizeof(debug_buffer), "PWM: Cmd L=%.2f R=%.2f | Speed L=%.2f R=%.2f",
+                     left_vel, right_vel, leftWheel.getSpeed(), rightWheel.getSpeed());
+        }
         publish_debug(debug_buffer);
 
-        // Log direction information occasionally
-        static int dir_log_counter = 0;
-        dir_log_counter++;
-        if (dir_log_counter % 50 == 0) // Every ~2.5 seconds at 20Hz
+        // Log PID performance information occasionally
+        static int pid_log_counter = 0;
+        pid_log_counter++;
+        if (pid_log_counter % 25 == 0) // Every ~1.25 seconds at 20Hz
         {
-            snprintf(debug_buffer, sizeof(debug_buffer), "Dir: L=%d R=%d | Pos: L=%.2f R=%.2f",
-                     leftWheel.getDirection(), rightWheel.getDirection(),
-                     leftWheel.getPosition(), rightWheel.getPosition());
+            snprintf(debug_buffer, sizeof(debug_buffer), "PID Errors: L=%.2f R=%.2f | Targets: L=%.2f R=%.2f",
+                     leftWheel.getPIDError(), rightWheel.getPIDError(),
+                     leftWheel.getTargetSpeed(), rightWheel.getTargetSpeed());
             publish_debug(debug_buffer);
         }
 
-        // Convert rad/s to PWM (-255 to +255)
-        // NOTE: Scale factor may need adjustment due to encoder tick change from 1055 to 720
-        float left_pwm = left_vel * 50.0; // Scale factor - tune as needed
-        float right_pwm = right_vel * 50.0;
+        // Enable motor driver when commands are received
+        enableMotorDriver();
 
-        leftWheel.moveMotor(left_pwm);
-        rightWheel.moveMotor(right_pwm);
+        if (ENABLE_PID)
+        {
+            // Use PID control for accurate speed control
+            leftWheel.setTargetSpeed(left_vel);
+            rightWheel.setTargetSpeed(right_vel);
+            // PID controllers will be updated in the joint states callback for consistent timing
+        }
+        else
+        {
+            // Fallback to direct PWM control for testing/comparison
+            float left_pwm = left_vel * 30.0; // Conservative scale factor
+            float right_pwm = right_vel * 30.0;
+            leftWheel.moveMotor(left_pwm);
+            rightWheel.moveMotor(right_pwm);
+        }
     }
     else
     {
         publish_debug("Velocity size < 2, stopping motors");
         leftWheel.stop();
         rightWheel.stop();
+        disableMotorDriver(); // Put motor driver in standby for safety
     }
 }
 
@@ -457,19 +671,29 @@ void joint_states_callback(rcl_timer_t *timer, int64_t last_call_time)
     if (counter % 100 == 0) // Every 5 seconds (20Hz * 100 = 5s)
     {
         publish_debug("Joint states timer callback running - executor is working");
-        
-        // Debug encoder positions and raw tick counts
+
+        // Debug encoder positions, raw tick counts, and speeds
         char debug_buffer[200];
-        snprintf(debug_buffer, sizeof(debug_buffer), "Raw ticks: L=%ld R=%ld | Positions: L=%.3f R=%.3f", 
-                leftWheel.CurrentPosition, rightWheel.CurrentPosition,
-                leftWheel.getPosition(), rightWheel.getPosition());
+        snprintf(debug_buffer, sizeof(debug_buffer), "Ticks: L=%ld R=%ld | Pos: L=%.2f R=%.2f | Speed: L=%.2f R=%.2f",
+                 leftWheel.CurrentPosition, rightWheel.CurrentPosition,
+                 leftWheel.getPosition(), rightWheel.getPosition(),
+                 leftWheel.getSpeed(), rightWheel.getSpeed());
+        publish_debug(debug_buffer);
+
+        // PID debugging for left motor
+        snprintf(debug_buffer, sizeof(debug_buffer), "PID Left: Target=%.2f Speed=%.2f Error=%.2f",
+                 leftWheel.getTargetSpeed(), leftWheel.getSpeed(), leftWheel.getPIDError());
         publish_debug(debug_buffer);
     }
 
     // Update speed calculations for both wheels (handles stopped motor detection)
     leftWheel.updateSpeedAndDirection();
     rightWheel.updateSpeedAndDirection();
-    
+
+    // Update PID controllers for both motors
+    leftWheel.updatePIDControl();
+    rightWheel.updatePIDControl();
+
     // Update joint positions from encoders
     joint_states_msg.position.data[0] = leftWheel.getPosition();
     joint_states_msg.position.data[1] = rightWheel.getPosition();
@@ -496,14 +720,20 @@ void setup()
     set_microros_transports();
 
     // Set up global interrupt handler for all encoder pins
+    // All pins need the callback explicitly set
     gpio_set_irq_enabled_with_callback(leftWheel.EncoderPinA, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &encoder_interrupt_handler);
-    gpio_set_irq_enabled(leftWheel.EncoderPinB, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
-    gpio_set_irq_enabled(rightWheel.EncoderPinA, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
-    gpio_set_irq_enabled(rightWheel.EncoderPinB, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled_with_callback(leftWheel.EncoderPinB, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &encoder_interrupt_handler);
+    gpio_set_irq_enabled_with_callback(rightWheel.EncoderPinA, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &encoder_interrupt_handler);
+    gpio_set_irq_enabled_with_callback(rightWheel.EncoderPinB, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &encoder_interrupt_handler);
 
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 0); // Start with LED off
+
+    // Initialize motor standby pin - HIGH disables standby
+    gpio_init(MOTOR_STANDBY_PIN);
+    gpio_set_dir(MOTOR_STANDBY_PIN, GPIO_OUT);
+    gpio_put(MOTOR_STANDBY_PIN, 1); // Set HIGH to disable standby
 
     // Initialize state machine
     state = WAITING_AGENT;
@@ -677,7 +907,7 @@ bool create_entities()
     joint_commands_msg.header.frame_id.size = 0;
 
     // timer for publishing joint states
-    const unsigned int publish_rate = 50; // 50ms = 20Hz
+    const unsigned int publish_rate = 20; // 50ms = 20Hz
     if (rclc_timer_init_default2(
             &joint_states_timer,
             &support,
@@ -732,9 +962,10 @@ void destroy_entities()
     rmw_context_t *rmw_context = rcl_context_get_rmw_context(&support.context);
     (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
 
-    // Stop motors when connection is lost
+    // Stop motors and disable driver when connection is lost
     leftWheel.stop();
     rightWheel.stop();
+    disableMotorDriver();
 
     // Clean up allocated memory for joint_states_msg
     if (joint_states_msg.name.data)
