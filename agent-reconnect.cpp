@@ -183,19 +183,29 @@ public:
     volatile bool LastEncoderAState;
     volatile bool LastEncoderBState;
 
+    // Speed averaging buffer
+    static const int SPEED_BUFFER_SIZE = 4; // Average over 4 readings (80ms at 50Hz)
+    float speed_buffer[SPEED_BUFFER_SIZE];
+    int speed_buffer_index;
+    bool speed_buffer_full;
+
     // PID Control
     PIDController pid_controller;
     float target_speed;          // Target speed in rad/s
     unsigned long last_pid_time; // Last PID calculation time
     bool pid_enabled;
 
+    // Current PWM output tracking
+    volatile float current_pwm_output;
+
     MotorController(int ForwardPin, int BackwardPin, int EnablePin, int EncoderA, int EncoderB, int tickPerRevolution)
         : Forward(ForwardPin), Backward(BackwardPin), Enable(EnablePin),
           EncoderPinA(EncoderA), EncoderPinB(EncoderB), tick(tickPerRevolution),
           CurrentPosition(0), PreviousPosition(0), CurrentSpeed(0.0), Direction(0),
           LastUpdateTime(0), LastPosition(0), EncoderAState(false), EncoderBState(false),
-          LastEncoderAState(false), LastEncoderBState(false), pid_controller(PID_KP, PID_KI, PID_KD),
-          target_speed(0.0), last_pid_time(0), pid_enabled(ENABLE_PID)
+          LastEncoderAState(false), LastEncoderBState(false), speed_buffer_index(0), speed_buffer_full(false),
+          pid_controller(PID_KP, PID_KI, PID_KD), target_speed(0.0), last_pid_time(0), pid_enabled(ENABLE_PID),
+          current_pwm_output(0.0)
     {
         gpio_init(Forward);
         gpio_set_dir(Forward, GPIO_OUT);
@@ -217,6 +227,9 @@ public:
         LastEncoderBState = EncoderBState;
         LastUpdateTime = to_ms_since_boot(get_absolute_time());
 
+        // Initialize speed buffer
+        resetSpeedBuffer();
+
         // Debug: Print initial encoder states (will be visible during startup)
         printf("Motor init: EncoderA=%d EncoderB=%d (pins %d,%d)\n",
                EncoderAState, EncoderBState, EncoderPinA, EncoderPinB);
@@ -234,16 +247,63 @@ public:
         return ((float)CurrentPosition / tick) * 2.0 * 3.14159;
     }
 
-    // get current speed in rad/s
+    // Add speed reading to averaging buffer
+    void addSpeedReading(float speed)
+    {
+        speed_buffer[speed_buffer_index] = speed;
+        speed_buffer_index = (speed_buffer_index + 1) % SPEED_BUFFER_SIZE;
+        if (!speed_buffer_full && speed_buffer_index == 0)
+        {
+            speed_buffer_full = true;
+        }
+    }
+
+    // get current averaged speed in rad/s
     float getSpeed()
     {
+        if (!speed_buffer_full && speed_buffer_index == 0)
+        {
+            return 0.0f; // No readings yet
+        }
+
+        float sum = 0.0f;
+        int count = speed_buffer_full ? SPEED_BUFFER_SIZE : speed_buffer_index;
+
+        for (int i = 0; i < count; i++)
+        {
+            sum += speed_buffer[i];
+        }
+
+        return sum / count;
+    }
+
+    // get instantaneous speed (non-averaged) for debugging
+    float getInstantSpeed()
+    {
         return CurrentSpeed;
+    }
+
+    // Reset speed averaging buffer
+    void resetSpeedBuffer()
+    {
+        for (int i = 0; i < SPEED_BUFFER_SIZE; i++)
+        {
+            speed_buffer[i] = 0.0f;
+        }
+        speed_buffer_index = 0;
+        speed_buffer_full = false;
     }
 
     // get current direction (-1, 0, 1)
     int getDirection()
     {
         return Direction;
+    }
+
+    // get current PWM output value
+    float getCurrentPWM()
+    {
+        return current_pwm_output;
     }
 
     // PID control methods
@@ -256,7 +316,7 @@ public:
         // Immediately stop motor if target speed is 0
         if (fabs(speed_rad_s) < 0.001f)
         {
-            stop();
+            stop(); // This will also reset the speed buffer
         }
     }
 
@@ -335,6 +395,9 @@ public:
                 float timeSeconds = (float)timeDelta / 1000.0;
                 CurrentSpeed = positionRadians / timeSeconds;
 
+                // Add speed reading to averaging buffer
+                addSpeedReading(CurrentSpeed);
+
                 // Determine direction
                 if (positionDelta > 0)
                     Direction = 1; // Forward
@@ -353,6 +416,8 @@ public:
         {
             CurrentSpeed = 0.0;
             Direction = 0;
+            // Add zero speed reading to buffer
+            addSpeedReading(0.0f);
         }
     }
 
@@ -448,6 +513,9 @@ public:
             pwm = 255;
         // Convert to duty cycle (0-65535 for 16-bit PWM)
         pwm_set_gpio_level(Enable, (pwm * 65535) / 255);
+
+        // Track current PWM output (with sign for direction)
+        current_pwm_output = (pwm_value > 0) ? pwm : -pwm;
     }
 
     void stop()
@@ -455,6 +523,10 @@ public:
         gpio_put(Forward, 0);
         gpio_put(Backward, 0);
         pwm_set_gpio_level(Enable, 0);
+        // Reset speed buffer when motor stops
+        resetSpeedBuffer();
+        // Reset PWM output tracking
+        current_pwm_output = 0.0;
     }
 };
 
@@ -585,10 +657,13 @@ void joint_commands_callback(const void *msgin)
         float right_vel = msg->velocity.data[1];
 
         // Log control mode and speeds
+        char debug_buffer[200]; // Increased buffer size for longer message
         if (ENABLE_PID)
         {
-            snprintf(debug_buffer, sizeof(debug_buffer), "PID: Target L=%.2f R=%.2f | Actual L=%.2f R=%.2f",
-                     left_vel, right_vel, leftWheel.getSpeed(), rightWheel.getSpeed());
+            snprintf(debug_buffer, sizeof(debug_buffer), "PID: Target L=%.2f R=%.2f | Avg L=%.2f R=%.2f | PWM L=%.0f R=%.0f | Instant L=%.2f R=%.2f",
+                     left_vel, right_vel, leftWheel.getSpeed(), rightWheel.getSpeed(),
+                     leftWheel.getCurrentPWM(), rightWheel.getCurrentPWM(),
+                     leftWheel.getInstantSpeed(), rightWheel.getInstantSpeed());
         }
         else
         {
@@ -668,21 +743,32 @@ void joint_states_callback(rcl_timer_t *timer, int64_t last_call_time)
 
     static int counter = 0;
     counter++;
-    if (counter % 100 == 0) // Every 5 seconds (20Hz * 100 = 5s)
+    if (counter % 50 == 0) // Every 1 second (50Hz * 50 = 1s)
     {
         publish_debug("Joint states timer callback running - executor is working");
 
         // Debug encoder positions, raw tick counts, and speeds
         char debug_buffer[200];
-        snprintf(debug_buffer, sizeof(debug_buffer), "Ticks: L=%ld R=%ld | Pos: L=%.2f R=%.2f | Speed: L=%.2f R=%.2f",
+        snprintf(debug_buffer, sizeof(debug_buffer),
+                 "Ticks: L=%ld R=%ld | Pos: L=%.2f R=%.2f",
                  leftWheel.CurrentPosition, rightWheel.CurrentPosition,
-                 leftWheel.getPosition(), rightWheel.getPosition(),
-                 leftWheel.getSpeed(), rightWheel.getSpeed());
+                 leftWheel.getPosition(), rightWheel.getPosition());
+        publish_debug(debug_buffer);
+        
+        snprintf(debug_buffer, sizeof(debug_buffer),
+                 "Speed Avg: L=%.2f R=%.2f | Instant: L=%.2f R=%.2f | PWM: L=%.0f R=%.0f",
+                 leftWheel.getSpeed(), rightWheel.getSpeed(),
+                 leftWheel.getInstantSpeed(), rightWheel.getInstantSpeed(),
+                 leftWheel.getCurrentPWM(), rightWheel.getCurrentPWM());
         publish_debug(debug_buffer);
 
-        // PID debugging for left motor
+        // PID debugging for both motors
         snprintf(debug_buffer, sizeof(debug_buffer), "PID Left: Target=%.2f Speed=%.2f Error=%.2f",
                  leftWheel.getTargetSpeed(), leftWheel.getSpeed(), leftWheel.getPIDError());
+        publish_debug(debug_buffer);
+        
+        snprintf(debug_buffer, sizeof(debug_buffer), "PID Right: Target=%.2f Speed=%.2f Error=%.2f",
+                 rightWheel.getTargetSpeed(), rightWheel.getSpeed(), rightWheel.getPIDError());
         publish_debug(debug_buffer);
     }
 
