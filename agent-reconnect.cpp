@@ -178,18 +178,16 @@ public:
     // Speed and direction tracking
     volatile float CurrentSpeed; // in rad/s
     volatile int Direction;      // 1 for forward, -1 for backward, 0 for stopped
-    volatile unsigned long LastUpdateTime;
+    volatile uint64_t LastUpdateTime;
     volatile long LastPosition;
     volatile bool EncoderAState;
     volatile bool EncoderBState;
     volatile bool LastEncoderAState;
     volatile bool LastEncoderBState;
 
-    // Speed averaging buffer
-    static const int SPEED_BUFFER_SIZE = 4; // Average over 4 readings (80ms at 50Hz)
-    float speed_buffer[SPEED_BUFFER_SIZE];
-    int speed_buffer_index;
-    bool speed_buffer_full;
+    // First-order lag filter for speed smoothing
+    float filtered_speed;       // Current filtered speed value
+    float filter_alpha;         // Filter coefficient (0.0 to 1.0, higher = less filtering)
 
     // PID Control
     PIDController pid_controller;
@@ -205,7 +203,7 @@ public:
           EncoderPinA(EncoderA), EncoderPinB(EncoderB), tick(tickPerRevolution),
           CurrentPosition(0), PreviousPosition(0), CurrentSpeed(0.0), Direction(0),
           LastUpdateTime(0), LastPosition(0), EncoderAState(false), EncoderBState(false),
-          LastEncoderAState(false), LastEncoderBState(false), speed_buffer_index(0), speed_buffer_full(false),
+          LastEncoderAState(false), LastEncoderBState(false), filtered_speed(0.0), filter_alpha(0.3),
           pid_controller(PID_KP, PID_KI, PID_KD), target_speed(0.0), last_pid_time(0), pid_enabled(ENABLE_PID),
           current_pwm_output(0.0)
     {
@@ -227,10 +225,10 @@ public:
         EncoderBState = gpio_get(EncoderPinB);
         LastEncoderAState = EncoderAState;
         LastEncoderBState = EncoderBState;
-        LastUpdateTime = to_ms_since_boot(get_absolute_time());
+        LastUpdateTime = time_us_64();
 
-        // Initialize speed buffer
-        resetSpeedBuffer();
+        // Initialize filter
+        filtered_speed = 0.0;
 
         // Debug: Print initial encoder states (will be visible during startup)
         printf("Motor init: EncoderA=%d EncoderB=%d (pins %d,%d)\n",
@@ -249,51 +247,30 @@ public:
         return ((float)CurrentPosition / tick) * 2.0 * 3.14159;
     }
 
-    // Add speed reading to averaging buffer
-    void addSpeedReading(float speed)
+    // Update first-order lag filter with new speed reading
+    void updateSpeedFilter(float raw_speed)
     {
-        speed_buffer[speed_buffer_index] = speed;
-        speed_buffer_index = (speed_buffer_index + 1) % SPEED_BUFFER_SIZE;
-        if (!speed_buffer_full && speed_buffer_index == 0)
-        {
-            speed_buffer_full = true;
-        }
+        // First-order lag filter: filtered = alpha * raw + (1 - alpha) * filtered_prev
+        // alpha = 0.3 gives moderate smoothing (~70% of previous, 30% of new)
+        filtered_speed = filter_alpha * raw_speed + (1.0 - filter_alpha) * filtered_speed;
     }
 
-    // get current averaged speed in rad/s
+    // get current filtered speed in rad/s
     float getSpeed()
     {
-        if (!speed_buffer_full && speed_buffer_index == 0)
-        {
-            return 0.0f; // No readings yet
-        }
-
-        float sum = 0.0f;
-        int count = speed_buffer_full ? SPEED_BUFFER_SIZE : speed_buffer_index;
-
-        for (int i = 0; i < count; i++)
-        {
-            sum += speed_buffer[i];
-        }
-
-        return sum / count;
+        return filtered_speed;
     }
 
-    // get instantaneous speed (non-averaged) for debugging
+    // get instantaneous speed (non-filtered) for debugging
     float getInstantSpeed()
     {
         return CurrentSpeed;
     }
 
-    // Reset speed averaging buffer
-    void resetSpeedBuffer()
+    // Reset speed filter
+    void resetSpeedFilter()
     {
-        for (int i = 0; i < SPEED_BUFFER_SIZE; i++)
-        {
-            speed_buffer[i] = 0.0f;
-        }
-        speed_buffer_index = 0;
-        speed_buffer_full = false;
+        filtered_speed = 0.0;
     }
 
     // get current direction (-1, 0, 1)
@@ -318,7 +295,7 @@ public:
         // Immediately stop motor if target speed is 0
         if (fabs(speed_rad_s) < 0.001f)
         {
-            stop(); // This will also reset the speed buffer
+            stop(); // This will also reset the speed filter
         }
     }
 
@@ -384,21 +361,21 @@ public:
     // update speed and direction based on encoder changes
     void updateSpeedAndDirection()
     {
-        unsigned long currentTime = to_ms_since_boot(get_absolute_time());
+        uint64_t currentTime = time_us_64();
         long positionDelta = CurrentPosition - LastPosition;
-        unsigned long timeDelta = currentTime - LastUpdateTime;
+        uint64_t timeDelta = currentTime - LastUpdateTime;
 
-        if (timeDelta > 10) // Update every 10ms minimum to avoid noise
+        if (timeDelta > 5000) // Update every 5ms minimum to avoid noise (5000 microseconds)
         {
             if (timeDelta > 0)
             {
                 // Calculate speed in rad/s
                 float positionRadians = ((float)positionDelta / tick) * 2.0 * 3.14159;
-                float timeSeconds = (float)timeDelta / 1000.0;
+                float timeSeconds = (float)timeDelta / 1000000.0; // Convert microseconds to seconds
                 CurrentSpeed = positionRadians / timeSeconds;
 
-                // Add speed reading to averaging buffer
-                addSpeedReading(CurrentSpeed);
+                // Update filtered speed with new raw speed reading
+                updateSpeedFilter(CurrentSpeed);
 
                 // Determine direction
                 if (positionDelta > 0)
@@ -414,12 +391,12 @@ public:
         }
 
         // If no movement for a while, consider stopped
-        if (timeDelta > 100) // 100ms without movement (faster stop detection)
+        if (timeDelta > 100000) // 100ms without movement (100,000 microseconds)
         {
             CurrentSpeed = 0.0;
             Direction = 0;
-            // Add zero speed reading to buffer
-            addSpeedReading(0.0f);
+            // Update filter with zero speed
+            updateSpeedFilter(0.0f);
         }
     }
 
@@ -525,8 +502,8 @@ public:
         gpio_put(Forward, 0);
         gpio_put(Backward, 0);
         pwm_set_gpio_level(Enable, 0);
-        // Reset speed buffer when motor stops
-        resetSpeedBuffer();
+        // Reset speed filter when motor stops
+        resetSpeedFilter();
         // Reset PWM output tracking
         current_pwm_output = 0.0;
     }
