@@ -56,8 +56,10 @@ rcl_subscription_t joint_commands_subscriber;
 rcl_subscription_t test_subscriber;
 rcl_publisher_t joint_states_publisher;
 rcl_publisher_t debug_publisher;
+rcl_publisher_t motor_debug_publisher;
 sensor_msgs__msg__JointState joint_commands_msg;
 sensor_msgs__msg__JointState joint_states_msg;
+sensor_msgs__msg__JointState motor_debug_msg;
 std_msgs__msg__String debug_msg;
 std_msgs__msg__String test_msg;
 rclc_executor_t executor;
@@ -798,6 +800,33 @@ void joint_states_callback(rcl_timer_t *timer, int64_t last_call_time)
     joint_states_msg.header.stamp.nanosec = time_stamp.tv_nsec;
 
     RCSOFTCHECK(rcl_publish(&joint_states_publisher, &joint_states_msg, NULL));
+
+    // Publish motor debug data every cycle (50Hz)
+    // Pack all debug data into velocity array with individual names:
+    // velocity[0-1]: encoder ticks (left_ticks, right_ticks)
+    motor_debug_msg.velocity.data[0] = (double)leftWheel.CurrentPosition;
+    motor_debug_msg.velocity.data[1] = (double)rightWheel.CurrentPosition;
+    // velocity[2-3]: wheel positions in radians (left_position, right_position)
+    motor_debug_msg.velocity.data[2] = leftWheel.getPosition();
+    motor_debug_msg.velocity.data[3] = rightWheel.getPosition();
+    // velocity[4-5]: averaged speeds (left_average, right_average)
+    motor_debug_msg.velocity.data[4] = leftWheel.getSpeed();
+    motor_debug_msg.velocity.data[5] = rightWheel.getSpeed();
+    // velocity[6-7]: instantaneous speeds (left_instant, right_instant)
+    motor_debug_msg.velocity.data[6] = leftWheel.getInstantSpeed();
+    motor_debug_msg.velocity.data[7] = rightWheel.getInstantSpeed();
+    // velocity[8-9]: PWM outputs (left_pwm, right_pwm)
+    motor_debug_msg.velocity.data[8] = leftWheel.getCurrentPWM();
+    motor_debug_msg.velocity.data[9] = rightWheel.getCurrentPWM();
+    // velocity[10-11]: target speeds (left_target, right_target)
+    motor_debug_msg.velocity.data[10] = leftWheel.getTargetSpeed();
+    motor_debug_msg.velocity.data[11] = rightWheel.getTargetSpeed();
+    
+    // Set timestamp for motor debug message
+    motor_debug_msg.header.stamp.sec = time_stamp.tv_sec;
+    motor_debug_msg.header.stamp.nanosec = time_stamp.tv_nsec;
+    
+    RCSOFTCHECK(rcl_publish(&motor_debug_publisher, &motor_debug_msg, NULL));
 }
 
 void setup()
@@ -920,6 +949,16 @@ bool create_entities()
         return false;
     }
 
+    // create motor debug publisher
+    if (rclc_publisher_init_default(
+            &motor_debug_publisher,
+            &node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
+            "/motor_debug") != RCL_RET_OK)
+    {
+        return false;
+    }
+
     // initialize joint state message
     joint_states_msg.name.capacity = 2;
     joint_states_msg.name.size = 2;
@@ -952,6 +991,50 @@ bool create_entities()
     joint_states_msg.header.frame_id.capacity = 20;
     strcpy(joint_states_msg.header.frame_id.data, "base_link");
     joint_states_msg.header.frame_id.size = strlen("base_link");
+
+    // Initialize motor debug message with individual names for each data field
+    // Using velocity array only with descriptive names for each field
+    motor_debug_msg.name.capacity = 12;
+    motor_debug_msg.name.size = 12;
+    motor_debug_msg.name.data = (rosidl_runtime_c__String *)malloc(12 * sizeof(rosidl_runtime_c__String));
+    
+    // Define all the field names
+    const char* field_names[] = {
+        "left_ticks", "right_ticks",
+        "left_position", "right_position", 
+        "left_average", "right_average",
+        "left_instant", "right_instant",
+        "left_pwm", "right_pwm",
+        "left_target", "right_target"
+    };
+    
+    // Initialize all name strings
+    for (int i = 0; i < 12; i++) {
+        motor_debug_msg.name.data[i].data = (char *)malloc(20 * sizeof(char));
+        motor_debug_msg.name.data[i].capacity = 20;
+        strcpy(motor_debug_msg.name.data[i].data, field_names[i]);
+        motor_debug_msg.name.data[i].size = strlen(field_names[i]);
+    }
+    
+    // Only use velocity array with 12 values
+    motor_debug_msg.velocity.capacity = 12;
+    motor_debug_msg.velocity.size = 12;
+    motor_debug_msg.velocity.data = (double *)malloc(12 * sizeof(double));
+    
+    // Initialize unused arrays as empty
+    motor_debug_msg.position.capacity = 0;
+    motor_debug_msg.position.size = 0;
+    motor_debug_msg.position.data = NULL;
+    
+    motor_debug_msg.effort.capacity = 0;
+    motor_debug_msg.effort.size = 0;
+    motor_debug_msg.effort.data = NULL;
+    
+    // Initialize header frame_id for motor debug
+    motor_debug_msg.header.frame_id.data = (char *)malloc(20 * sizeof(char));
+    motor_debug_msg.header.frame_id.capacity = 20;
+    strcpy(motor_debug_msg.header.frame_id.data, "base_link");
+    motor_debug_msg.header.frame_id.size = strlen("base_link");
 
     // Initialize debug message
     debug_msg.data.data = (char *)malloc(200 * sizeof(char));
@@ -1083,6 +1166,29 @@ void destroy_entities()
         free(joint_states_msg.header.frame_id.data);
         joint_states_msg.header.frame_id.data = NULL;
     }
+    
+    // Clean up motor debug message
+    if (motor_debug_msg.name.data)
+    {
+        for (int i = 0; i < 12; i++)
+        {
+            if (motor_debug_msg.name.data[i].data)
+                free(motor_debug_msg.name.data[i].data);
+        }
+        free(motor_debug_msg.name.data);
+        motor_debug_msg.name.data = NULL;
+    }
+    if (motor_debug_msg.velocity.data)
+    {
+        free(motor_debug_msg.velocity.data);
+        motor_debug_msg.velocity.data = NULL;
+    }
+    // position and effort arrays are NULL, no cleanup needed
+    if (motor_debug_msg.header.frame_id.data)
+    {
+        free(motor_debug_msg.header.frame_id.data);
+        motor_debug_msg.header.frame_id.data = NULL;
+    }
     if (debug_msg.data.data)
     {
         free(debug_msg.data.data);
@@ -1129,6 +1235,7 @@ void destroy_entities()
     }
 
     (void)rcl_publisher_fini(&debug_publisher, &node);
+    (void)rcl_publisher_fini(&motor_debug_publisher, &node);
     (void)rcl_publisher_fini(&joint_states_publisher, &node);
     (void)rcl_subscription_fini(&joint_commands_subscriber, &node);
     (void)rcl_subscription_fini(&test_subscriber, &node);
